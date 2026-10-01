@@ -12,6 +12,8 @@ You keep the keys. You keep the code. You keep the edge.
 
 This article is the full build. Folder structure, the CLAUDE.md that keeps Claude on rails, the feed code, the rug filter, the execution layer for both the bonding curve and graduated tokens, the exit logic and the terminal UI. Copy the pieces, paste them into your own repo, and let Claude Code wire the rest.
 
+Full code, type-checked and MIT-licensed: [github.com/Mason333xbt/sol-terminal](https://github.com/Mason333xbt/sol-terminal). Clone it, run `npm install`, `npm run fixture` and `npm run replay`, and the bot trades a synthetic feed on your machine in seconds. Every code block below is the exact file from that repo.
+
 ### What the terminal reads
 
 | Source | Transport | What it gives the bot |
@@ -62,27 +64,33 @@ claude
 ```text
 sol-terminal/
   CLAUDE.md            # rules Claude reads every session
-  .env                 # keys, never committed
+  .env.example         # copy to .env; .env is never committed
   src/
     feeds/
       pumpportal.ts    # websocket: launches, migrations, trades
       dexscreener.ts   # REST poller with a rate limiter
     core/
       token.ts         # one Token model for every source
-      store.ts         # in-memory state + event bus
-      score.ts         # filters and scoring
-      safety.ts        # on-chain rug checks
+      store.ts         # in-memory state, clock, event bus
+      limiter.ts       # sliding-window rate limiter
+      score.ts         # Gate 1: filters and scoring
+      safety.ts        # Gate 2: on-chain rug checks
     exec/
+      signer.ts        # local signing + send + confirm
       pump.ts          # bonding-curve trades via PumpPortal
       jupiter.ts       # graduated tokens via Jupiter
-      signer.ts        # local signing + send
+      index.ts         # router: picks the venue by stage
     bot/
-      positions.ts     # TP, stop, trailing, paper mode
-    server.ts          # local WS that feeds the UI
+      index.ts         # the loop: exits, then entries
+      positions.ts     # TP, stop, trailing, stale, timeout
+      paperFill.ts     # pessimistic paper cost model
+    server.ts          # bot loop + local WS for the UI
   ui/
     terminal.html      # the screen
   test/
     replay.ts          # replays recorded feed data
+    make-fixture.ts    # synthetic feed for smoke tests
+  fixtures/            # recordings, git-ignored
 ```
 
 Every folder answers one question. Where does data come from, what do we think about it, how do we trade it, how do we show it. When Claude knows where a thing lives, it stops inventing new files.
@@ -102,16 +110,22 @@ This file is the cheapest upgrade you'll ever make. Claude reads it at the start
 - All external calls go through a rate limiter with retry + jitter.
 - DexScreener: 300 req/min on pairs/tokens/search, 60 req/min on profiles/boosts.
 - New feed or venue = new file in src/feeds or src/exec. Never patch Token for one source.
+- Time in src/core and src/bot comes from store.now(), never Date.now(), or replay lies.
+- The UI never renders feed text with innerHTML. Token names come from strangers.
 
 ## Commands
-- npm run dev      -> tsx watch src/server.ts
-- npm run replay   -> tsx test/replay.ts fixtures/day1.jsonl
+- npm run dev        -> tsx watch src/server.ts
+- npm run record     -> live feeds, writes fixtures/YYYY-MM-DD.jsonl
+- npm run fixture    -> regenerate the synthetic fixtures/sample.jsonl
+- npm run replay     -> tsx test/replay.ts [fixtures/file.jsonl]
 - npm run typecheck
 
 ## Done means
-- typecheck passes, replay runs 10 min with zero unhandled rejections,
+- typecheck passes, replay runs with zero unhandled rejections,
   and the UI shows feed, scores and positions.
 ```
+
+The last two rules come from real bugs found while building the repo. Once they sit in CLAUDE.md, Claude checks every new file against them.
 
 ### .env
 
@@ -188,6 +202,7 @@ class Store extends EventEmitter {
   upsert(t: Token) {
     const prev = this.tokens.get(t.mint);
     this.tokens.set(t.mint, { ...prev, ...t, updatedAt: this.now() });
+    this.emit("record", { ts: this.now(), kind: "token", data: t });
     this.emit("token", t.mint);
   }
 
@@ -195,6 +210,7 @@ class Store extends EventEmitter {
     const cur = this.tokens.get(mint);
     if (!cur) return;                        // ignore tokens we never saw launch
     Object.assign(cur, data, { updatedAt: this.now() });
+    this.emit("record", { ts: this.now(), kind: "patch", mint, data });
     this.emit("token", mint);
   }
 
@@ -227,6 +243,8 @@ class Store extends EventEmitter {
 
 export const store = new Store();
 ```
+
+Every change fires a `record` event too. `npm run record` writes those to disk, and that file is what replay feeds back in (section 9).
 
 ### The rate limiter
 
@@ -408,6 +426,7 @@ The pipeline runs in two gates. A cheap gate on every launch, using data you alr
 ```ts
 // src/core/score.ts
 import type { Token } from "./token";
+import { store } from "./store";
 
 export const RULES = {
   minAgeSec: 30,          // let the first bot wave clear
@@ -419,7 +438,7 @@ export const RULES = {
 };
 
 export function passesGate1(t: Token): boolean {
-  const ageSec = (Date.now() - t.createdAt) / 1000;
+  const ageSec = (store.now() - t.createdAt) / 1000;   // store clock, so replay ages tokens right
   if (ageSec < RULES.minAgeSec || ageSec > RULES.maxAgeMin * 60) return false;
   if ((t.devBuySol ?? 0) > RULES.maxDevBuySol) return false;
   if (t.stage !== "curve" && (t.liquidityUsd ?? 0) < RULES.minLiquidityUsd) return false;
@@ -437,6 +456,8 @@ export function score(t: Token): number {
 }
 ```
 
+Note `store.now()` on the age line. The first version used `Date.now()`, and in replay every token looked days old, so the bot opened zero trades. One line, whole backtest dead.
+
 These numbers are a starting point. They are not a strategy. Your replay data (section 9) tells you where to move them.
 
 ### Gate 2: on-chain safety
@@ -445,12 +466,14 @@ Three questions settle most rugs. Can someone still mint more supply? Can someon
 
 ```ts
 // src/core/safety.ts
-import { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 import { getMint, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
-
-const conn = new Connection(process.env.RPC_URL!, "confirmed");
+import { conn } from "../exec/signer";
 
 export async function checkSafety(mint: string, ignore: string[] = []) {
+  // replay runs offline: skip RPC, treat every token as passing Gate 2
+  if (process.env.SAFETY_STUB === "1") return { ok: true, reasons: [], topPct: 0 };
+
   const reasons: string[] = [];
   const key = new PublicKey(mint);
 
@@ -494,8 +517,13 @@ The only file that touches your key. Everything else gets a function, never the 
 import { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
 import bs58 from "bs58";
 
-export const conn = new Connection(process.env.RPC_URL!, "confirmed");
-const wallet = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_SECRET_B58!));
+export const conn = new Connection(process.env.RPC_URL || "https://api.mainnet-beta.solana.com", "confirmed");
+
+// paper mode runs without a real key: a throwaway keypair stands in, and it can never send
+const secret = process.env.WALLET_SECRET_B58;
+const ephemeral = !secret;
+const wallet = secret ? Keypair.fromSecretKey(bs58.decode(secret)) : Keypair.generate();
+if (ephemeral) console.warn("[signer] no WALLET_SECRET_B58: paper mode only");
 
 export const owner = wallet.publicKey;
 export const publicKey = owner.toBase58();
@@ -503,6 +531,7 @@ export const publicKey = owner.toBase58();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function signAndSend(tx: VersionedTransaction): Promise<string> {
+  if (ephemeral) throw new Error("live trade refused: set WALLET_SECRET_B58 to trade live");
   tx.sign([wallet]);
   const raw = tx.serialize();
 
@@ -528,6 +557,8 @@ export async function signAndSend(tx: VersionedTransaction): Promise<string> {
   throw new Error(`confirm timeout: ${sig}`);
 }
 ```
+
+No key in `.env`? The signer swaps in a throwaway keypair so paper mode runs with zero setup, and refuses any live send. You can't trade real money by accident.
 
 The common mistake is fetching a fresh blockhash after sending and confirming against that. The fresh one lives longer than the one inside your transaction, so the bot keeps waiting for a trade that already died. Here the loop checks the transaction's own blockhash and quits the moment it expires.
 
@@ -688,6 +719,7 @@ export const EXIT = {
   tp1: 0.6,             // +60%: sell half
   trail: 0.22,          // after tp1, exit 22% under the peak
   maxHoldMin: 20,       // flat and old = out
+  staleMin: 5,          // no price update for this long = the feed died, get out
 };
 
 type Log = (s: string) => void;
@@ -700,6 +732,7 @@ export async function onTick(p: Position, t: Token, log: Log) {
   const fromPeak = px / p.peak - 1;
   const ageMin = (store.now() - p.openedAt) / 60_000;
 
+  if ((store.now() - t.updatedAt) / 60_000 > EXIT.staleMin) return exit(p, t, 1, `STALE ${pct(pnl)}`, log);
   if (pnl <= EXIT.stopLoss) return exit(p, t, 1, `STOP ${pct(pnl)}`, log);
   if (p.remaining === 1 && pnl >= EXIT.tp1) return exit(p, t, 0.5, `TP1 ${pct(pnl)}`, log);
   if (p.remaining < 1 && fromPeak <= -EXIT.trail) return exit(p, t, 1, `TRAIL ${pct(pnl)}`, log);
@@ -724,6 +757,8 @@ export async function exit(p: Position, t: Token, fraction: number, why: string,
 
 const pct = (x: number) => `${x >= 0 ? "+" : ""}${(x * 100).toFixed(1)}%`;
 ```
+
+The `STALE` rule runs first for a reason. A token that stops trading stops sending prices, so no other rule ever fires and the position hangs open forever. The first replay showed exactly that: most of the bags never closed.
 
 Sells go through the router from section 6, which checks `stage` at sell time. A token that migrated while you held it exits through Jupiter without any special case here.
 
@@ -819,6 +854,7 @@ class Bot {
 
   positions() {
     return [...this.open.values()].map((p) => ({
+      mint: p.mint,
       symbol: p.symbol,
       pnl: (store.get(p.mint)?.priceSol ?? p.entry) / p.entry - 1,
     }));
@@ -847,7 +883,7 @@ class Bot {
 export const bot = new Bot();
 ```
 
-Two lines in `server.ts` drive it live: `setInterval(() => bot.step().catch((e) => bot.log.push("ERR " + e.message)), 500)` and `store.on("watch", (m) => pumpportal.watch([m]))`, where `pumpportal` is the handle `startPumpPortal()` returns. Replay calls `bot.step()` itself, so the loop never starts twice.
+`server.ts` (next section) drives this loop every 500 ms and subscribes PumpPortal trades for every mint the bot buys. Replay calls `bot.step()` itself, so the loop never runs twice.
 
 ### Paper mode first, always
 
@@ -909,14 +945,38 @@ The UI never talks to Solana and never sees a key. It reads state and sends two 
 
 ```ts
 // src/server.ts
+import "dotenv/config";                  // must load before any module reads process.env
 import { WebSocketServer } from "ws";
+import { appendFileSync, mkdirSync } from "fs";
 import { store } from "./core/store";
 import { startPumpPortal } from "./feeds/pumpportal";
 import "./feeds/dexscreener";
 import { bot } from "./bot";
 
-startPumpPortal();
-const wss = new WebSocketServer({ host: "127.0.0.1", port: 8787 });
+const PORT = Number(process.env.PORT ?? 8787);
+const pumpportal = startPumpPortal();
+
+// open positions need live curve prices: subscribe their trade stream
+store.on("watch", (mint: string) => pumpportal.watch([mint]));
+
+// RECORD=1 writes every store event to fixtures/ for replay later
+if (process.env.RECORD === "1") {
+  mkdirSync("fixtures", { recursive: true });
+  const file = `fixtures/${new Date().toISOString().slice(0, 10)}.jsonl`;
+  store.on("record", (e: unknown) => appendFileSync(file, JSON.stringify(e) + "\n"));
+  console.log(`[record] writing ${file}`);
+}
+
+// the bot loop: exits first, then entries
+setInterval(() => {
+  bot.step().catch((e: Error) => bot.log.push("ERR " + e.message));
+}, 500);
+
+// keep memory flat on long sessions
+setInterval(() => store.prune(new Set(bot.positions().map((p) => p.mint))), 60_000);
+
+const wss = new WebSocketServer({ host: "127.0.0.1", port: PORT });
+console.log(`[ui] ws://127.0.0.1:${PORT}  open ui/terminal.html  mode=${bot.paper ? "PAPER" : "LIVE"}`);
 
 // push a compact snapshot 4 times a second
 setInterval(() => {
@@ -934,9 +994,13 @@ setInterval(() => {
 
 wss.on("connection", (ws) => {
   ws.on("message", (raw) => {
-    const cmd = JSON.parse(raw.toString());
-    if (cmd.type === "buy") bot.manualBuy(cmd.mint);
-    if (cmd.type === "panic") bot.closeAll("PANIC");
+    try {
+      const cmd = JSON.parse(raw.toString());
+      if (cmd.type === "buy" && typeof cmd.mint === "string") bot.manualBuy(cmd.mint).catch((e: Error) => bot.log.push("ERR " + e.message));
+      if (cmd.type === "panic") bot.closeAll("PANIC").catch((e: Error) => bot.log.push("ERR " + e.message));
+    } catch {
+      /* ignore malformed commands */
+    }
   });
 });
 ```
@@ -946,7 +1010,7 @@ Bind to `127.0.0.1`. A trading server open on `0.0.0.0` is an invitation.
 ### Client side
 
 ```html
-<!-- ui/terminal.html (trimmed) -->
+<!-- ui/terminal.html (trimmed: styles, the HIDE toggle and reconnect live in the repo) -->
 <body>
   <header>
     <b>SOL TERMINAL</b>
@@ -956,37 +1020,64 @@ Bind to `127.0.0.1`. A trading server open on `0.0.0.0` is an invitation.
   </header>
   <main>
     <section><h2>LAUNCHES</h2><ul id="feed"></ul></section>
-    <section><h2>WATCHLIST</h2><table id="watch"></table></section>
-    <section><h2>POSITIONS</h2><table id="pos"></table><pre id="log"></pre></section>
+    <section><h2>WATCHLIST</h2><table><tbody id="watch"></tbody></table></section>
+    <section><h2>POSITIONS</h2><table><tbody id="pos"></tbody></table><pre id="log"></pre></section>
   </main>
 <script>
-const ws = new WebSocket("ws://127.0.0.1:8787");
-const $ = (id) => document.getElementById(id);
-const usd = (n) => n == null ? "-" : "$" + Number(n).toLocaleString();
+  // Token names and symbols come from strangers on pump.fun.
+  // Never put them into innerHTML: build nodes and set textContent.
+  const $ = (id) => document.getElementById(id);
+  const MINT = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;      // base58 address shape
+  const usd = (n) => (n == null ? "-" : "$" + Math.round(n).toLocaleString());
 
-ws.onmessage = (e) => {
-  const s = JSON.parse(e.data);
-  $("mode").textContent = s.paper ? "PAPER" : "LIVE";
-  $("pnl").textContent = s.pnl.toFixed(3) + " SOL";
-  $("pnl").className = s.pnl >= 0 ? "up" : "down";
+  function el(tag, text, cls) {
+    const e = document.createElement(tag);
+    if (text != null) e.textContent = String(text);
+    if (cls) e.className = cls;
+    return e;
+  }
 
-  $("feed").innerHTML = s.feed.map(t =>
-    `<li class="${t.safety?.ok === false ? 'bad' : ''}">${t.symbol} <i>${t.stage}</i></li>`).join("");
+  const ws = new WebSocket("ws://127.0.0.1:8787");
+  ws.onmessage = (e) => {
+    const s = JSON.parse(e.data);
+    $("mode").textContent = s.paper ? "PAPER" : "LIVE";
+    $("pnl").textContent = (s.pnl >= 0 ? "+" : "") + s.pnl.toFixed(3) + " SOL";
+    $("pnl").className = s.pnl >= 0 ? "up" : "down";
 
-  $("watch").innerHTML = s.watch.map(t => `
-    <tr><td>${t.symbol}</td><td>${t.score}</td><td>${usd(t.liquidityUsd)}</td>
-    <td>${t.buysM5 ?? 0}/${t.sellsM5 ?? 0}</td>
-    <td><button onclick='ws.send(JSON.stringify({type:"buy",mint:"${t.mint}"}))'>BUY</button></td></tr>`).join("");
+    $("feed").replaceChildren(...s.feed.map((t) => {
+      const li = el("li", null, t.safety?.ok === false ? "bad" : "");
+      li.append(el("span", t.symbol), el("i", t.stage));
+      return li;
+    }));
 
-  $("pos").innerHTML = s.positions.map(p =>
-    `<tr><td>${p.symbol}</td><td class="${p.pnl >= 0 ? 'up' : 'down'}">${(p.pnl * 100).toFixed(1)}%</td></tr>`).join("");
-  $("log").textContent = s.log.join("\n");
-};
+    $("watch").replaceChildren(...s.watch.map((t) => {
+      const tr = el("tr");
+      tr.append(el("td", t.symbol), el("td", t.score), el("td", usd(t.liquidityUsd)),
+                el("td", `${t.buysM5 ?? 0}/${t.sellsM5 ?? 0}`));
+      const td = el("td");
+      if (MINT.test(t.mint)) {
+        const b = el("button", "BUY");
+        b.onclick = () => ws.send(JSON.stringify({ type: "buy", mint: t.mint }));
+        td.append(b);
+      }
+      tr.append(td);
+      return tr;
+    }));
 
-$("panic").onclick = () => confirm("Close everything?") && ws.send(JSON.stringify({ type: "panic" }));
+    $("pos").replaceChildren(...s.positions.map((p) => {
+      const tr = el("tr");
+      tr.append(el("td", p.symbol), el("td", (p.pnl * 100).toFixed(1) + "%", p.pnl >= 0 ? "up" : "down"));
+      return tr;
+    }));
+    $("log").textContent = s.log.slice().reverse().join("\n");
+  };
+
+  $("panic").onclick = () => confirm("Close everything?") && ws.send(JSON.stringify({ type: "panic" }));
 </script>
 </body>
 ```
+
+Read the comment at the top of the script twice. Anyone can launch a pump.fun token and name it with a chunk of HTML. Drop that name into `innerHTML` and the code runs inside the one page on your machine that has a BUY button. Every value from the feed goes through `textContent`, and the BUY button only exists for strings shaped like a real Solana address.
 
 That's the skeleton. The look is where Claude Code earns its keep. I asked for a black-and-gold desk with flashing rows on new launches, a gold glow on fresh highs, red pulses on stops and a clean HIDE mode for screen recording. It came back as one file I could open straight away.
 
@@ -1001,9 +1092,9 @@ Claude Code lives in your terminal, reads the repo, runs commands and edits file
 One layer per session. Each layer gets tested before the next one starts.
 
 1. Token model + store. Nothing else.
-2. PumpPortal feed, logging raw messages to `fixtures/raw.jsonl`.
+2. PumpPortal feed. Start `npm run record` on day one, so every event lands in `fixtures/`.
 3. DexScreener poller with the limiter.
-4. Score + safety, run against the recorded fixtures.
+4. Score + safety, run against the recordings.
 5. Execution in paper mode only.
 6. Position manager + replay test.
 7. Server + terminal UI.
@@ -1043,11 +1134,17 @@ Record the live feed once, replay it forever. Same code path as live, with time 
 
 ```ts
 // test/replay.ts
-import { readFileSync } from "fs";
+import "dotenv/config";
+import { existsSync, readFileSync } from "fs";
 import { store } from "../src/core/store";
 import { bot } from "../src/bot";
 
-const file = process.argv[2] ?? "fixtures/day1.jsonl";
+const file = process.argv[2] ?? "fixtures/sample.jsonl";
+process.env.SAFETY_STUB = "1";            // no RPC calls during replay
+if (!existsSync(file)) {
+  console.error(`${file} not found. Run \`npm run fixture\` for the synthetic sample, or \`npm run record\` for real data.`);
+  process.exit(1);
+}
 const events = readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 
 bot.paper = true;
@@ -1061,12 +1158,18 @@ for (const e of events) {
   await bot.step();                        // score, safety stub, entries, exits
 }
 
+// close whatever is still open at the last price, so stats count every trade
+await bot.closeAll("END");
+await bot.step();
+
 console.table(bot.stats());
 console.log("unhandled rejections:", errors);
 process.exit(errors ? 1 : 0);
 ```
 
-In replay, the safety check reads cached results from the fixture, so you don't hammer your RPC. The snippets above call `Date.now()` to stay readable. In your repo, route every one of them through `store.now()`, or replay ages tokens wrong and the filters lie to you.
+`SAFETY_STUB` skips the RPC calls, so a full day of recordings replays in seconds without touching your RPC bill. Every clock read in `src/core` and `src/bot` goes through `store.now()`, and replay sets `store.clock` to each event's timestamp. That's how token ages and hold times come out right.
+
+The repo also ships `npm run fixture`, which writes a synthetic feed for smoke tests. It proves the pipeline runs end to end. Its stats say nothing about any strategy, so record real data before you tune a single number.
 
 ### Habits that saved hours
 
@@ -1108,10 +1211,13 @@ A dozen small files. One HTML screen. One CLAUDE.md that keeps the machine hones
 
 The people still clicking through DexScreener tabs at 3 AM are trading against bots built exactly like this. Now you have the blueprint for yours.
 
+All of it is on GitHub: [github.com/Mason333xbt/sol-terminal](https://github.com/Mason333xbt/sol-terminal). Fork it, run it in paper mode, and break it there before it breaks your wallet.
+
 Not financial advice. Memecoin trading can wipe a wallet fast. Size as if every trade goes to zero.
 
 ### Sources
 
+- [sol-terminal on GitHub](https://github.com/Mason333xbt/sol-terminal) (full code from this article)
 - [DexScreener API reference](https://docs.dexscreener.com/api/reference) (endpoints and rate limits)
 - [PumpPortal trading and data API](https://github.com/TrustPump/Pump-Fun-API) (websocket methods, trade-local, fees)
 - [Jupiter Get Quote docs](https://jupiter.mintlify.app/docs/swap/get-quote) (api.jup.ag, lite-api deprecation)

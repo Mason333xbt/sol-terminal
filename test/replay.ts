@@ -5,11 +5,11 @@ import { store } from "../src/core/store";
 import { bot } from "../src/bot";
 
 const file = process.argv[2] ?? "fixtures/sample.jsonl";
-process.env.SAFETY_STUB = "1";
+process.env.SAFETY_STUB = "1";            // no RPC calls during replay
 if (!existsSync(file)) {
   console.error(`${file} not found. Run \`npm run fixture\` for the synthetic sample, or \`npm run record\` for real data.`);
   process.exit(1);
-}            // no RPC calls during replay
+}
 const events = readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 
 bot.paper = true;

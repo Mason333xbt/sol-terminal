@@ -1,7 +1,6 @@
 // src/core/safety.ts
 import { PublicKey } from "@solana/web3.js";
 import { getMint, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
-
 import { conn } from "../exec/signer";
 
 export async function checkSafety(mint: string, ignore: string[] = []) {

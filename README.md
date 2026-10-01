@@ -74,15 +74,11 @@ Replay stubs Gate 2 (no RPC calls) and only exercises curve tokens offline. Pape
 
 Closing empty token accounts (about 0.002 SOL rent each) is not automated yet. See the costs section in the article.
 
-## Differences from the article
+## Notes
 
-The repo fixes a few things the trimmed article code skips:
-
-- `score.ts` ages tokens with `store.now()`, so replay filters work.
-- `positions.ts` has a `staleMin` exit: a token whose price stops updating gets closed instead of hanging forever.
-- `signer.ts` runs without a key in paper mode and refuses to send anything live without one.
-- `ui/terminal.html` never renders token names with `innerHTML`. Names and symbols on pump.fun are chosen by strangers, and a name written as HTML would run inside the page that holds your BUY button.
-- `server.ts` runs the bot loop, wires trade subscriptions for open positions, records fixtures and prunes old tokens.
+- Every code block in [ARTICLE.md](ARTICLE.md) is the exact file from this repo. The UI is shown trimmed there; the full page is `ui/terminal.html`.
+- `ui/terminal.html` never renders token names with `innerHTML`. Names and symbols on pump.fun are chosen by strangers.
+- Without `WALLET_SECRET_B58` the signer refuses every live send, so paper mode runs with zero setup.
 
 ## Sources
 
